@@ -1,0 +1,25 @@
+total_capacity_mw: 500
+peak_multiplier: 1.30
+seed: 42
+
+tasks:
+  - name: interactive_serving
+    flexibility_hours: 0
+    share_of_demand: 0.30
+    max_power_multiplier: 2.0
+    color: "#e74c3c"
+  - name: etl_pipeline
+    flexibility_hours: 2
+    share_of_demand: 0.20
+    max_power_multiplier: 2.0
+    color: "#f39c12"
+  - name: batch_ml_training
+    flexibility_hours: 12
+    share_of_demand: 0.35
+    max_power_multiplier: 2.0
+    color: "#3498db"
+  - name: cold_backup
+    flexibility_hours: 24
+    share_of_demand: 0.15
+    max_power_multiplier: 2.0
+    color: "#2ecc71"
