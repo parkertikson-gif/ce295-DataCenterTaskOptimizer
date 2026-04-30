@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import sqrt
 
 import cvxpy as cp
 import numpy as np
 import pandas as pd
+
+from .penalty import build_delay_matrix
 
 
 HORIZON_HOURS = 168
@@ -15,12 +18,16 @@ class OptResult:
     alpha: float
     season: str
     power_by_task: dict[str, np.ndarray]   # inner 168h per task (MW)
-    total_power: np.ndarray                # inner 168h (MW)
+    total_power: np.ndarray                # inner 168h (MW), net of battery if enabled
     lmp_inner: np.ndarray                  # inner 168h ($/MWh)
     moer_inner: np.ndarray                 # inner 168h (lb/MWh)
     lmp_norm_inner: np.ndarray
     moer_norm_inner: np.ndarray
     status: str
+    gamma: float = 0.0
+    battery_charge: np.ndarray | None = None    # inner 168h (MW)
+    battery_discharge: np.ndarray | None = None # inner 168h (MW)
+    battery_soc: np.ndarray | None = None       # inner 168h (MWh)
 
 
 def tile_signal(signal_24: np.ndarray, length: int, start_offset: int = 0) -> np.ndarray:
@@ -40,6 +47,7 @@ def solve(
     moer_24: np.ndarray,
     alpha: float,
     season: str,
+    gamma: float = 0.0,
 ) -> OptResult:
     """Solve the LP for a single (season, alpha).
 
@@ -60,12 +68,15 @@ def solve(
     total_capacity = float(config["total_capacity_mw"])
     p_max = float(config.get("peak_multiplier", 1.15)) * total_capacity
 
+    delay_matrices = build_delay_matrix(config)
+
     # Build per-task variables and accumulate padded power expression.
     task_names = [t["name"] for t in config["tasks"]]
     variables: dict[str, cp.Variable] = {}
     per_task_power_padded: dict[str, cp.Expression] = {}
     constraints: list = []
     p_padded = cp.Constant(np.zeros(h_pad))
+    penalty_term: cp.Expression = cp.Constant(0.0)
 
     for task in config["tasks"]:
         name = task["name"]
@@ -103,20 +114,61 @@ def solve(
         per_task_power_padded[name] = task_power
         p_padded = p_padded + task_power
 
+        # Delay penalty for tasks with flexibility (linear in X).
+        if w > 0:
+            D_s = delay_matrices[name]
+            for s in range(w + 1):
+                penalty_term = penalty_term + D_s[s] * cp.sum(cp.multiply(X[:, s], d_k))
+
         # Per-task hourly cap (full padded horizon).
         share = float(task["share_of_demand"])
         mult = float(task.get("max_power_multiplier", 2.0))
         per_task_cap = mult * share * total_capacity
         constraints.append(task_power <= per_task_cap)
 
+    # Battery (BESS) co-optimization, if enabled.
+    battery_cfg = config.get("battery", {}) or {}
+    battery_on = bool(battery_cfg.get("enabled", False))
+    u_charge = u_discharge = soc = None
+    kappa = 0.0
+    if battery_on:
+        E_max = float(battery_cfg["capacity_mwh"])
+        max_charge = float(battery_cfg["max_charge_mw"])
+        max_discharge = float(battery_cfg["max_discharge_mw"])
+        efficiency = float(battery_cfg["efficiency"])
+        eta = sqrt(efficiency)
+        soc_min = float(battery_cfg["soc_min_frac"]) * E_max
+        soc_max = float(battery_cfg["soc_max_frac"]) * E_max
+        soc_init = float(battery_cfg["soc_init_frac"]) * E_max
+        kappa = float(battery_cfg["degradation_cost"])
+
+        u_charge = cp.Variable(h_pad, nonneg=True)
+        u_discharge = cp.Variable(h_pad, nonneg=True)
+        soc = cp.Variable(h_pad + 1, nonneg=True)
+
+        constraints.append(soc[1:] == soc[:-1] + eta * u_charge - (1.0 / eta) * u_discharge)
+        constraints.append(soc >= soc_min)
+        constraints.append(soc <= soc_max)
+        constraints.append(u_charge <= max_charge)
+        constraints.append(u_discharge <= max_discharge)
+        constraints.append(u_charge + u_discharge <= max(max_charge, max_discharge))
+        constraints.append(soc[0] == soc_init)
+        constraints.append(soc[h_pad] == soc_init)
+
+        # Battery participates in facility net power draw.
+        p_padded = p_padded + u_charge - u_discharge
+
     constraints.append(p_padded <= p_max)
 
-    objective = cp.Minimize(
+    objective_expr = (
         alpha * cp.sum(cp.multiply(lmp_norm, p_padded))
         + (1.0 - alpha) * cp.sum(cp.multiply(moer_norm, p_padded))
+        + gamma * penalty_term
     )
+    if battery_on:
+        objective_expr = objective_expr + kappa * cp.sum(u_charge + u_discharge)
 
-    prob = cp.Problem(objective, constraints)
+    prob = cp.Problem(cp.Minimize(objective_expr), constraints)
     prob.solve(solver=cp.CLARABEL)
 
     # Extract inner 168h results.
@@ -126,6 +178,12 @@ def solve(
         vals = per_task_power_padded[name].value
         power_by_task[name] = np.asarray(vals[inner]).flatten()
     total_power = np.asarray(p_padded.value[inner]).flatten()
+
+    battery_charge_inner = battery_discharge_inner = battery_soc_inner = None
+    if battery_on:
+        battery_charge_inner = np.asarray(u_charge.value[inner]).flatten()
+        battery_discharge_inner = np.asarray(u_discharge.value[inner]).flatten()
+        battery_soc_inner = np.asarray(soc.value[inner]).flatten()
 
     return OptResult(
         alpha=alpha,
@@ -137,4 +195,8 @@ def solve(
         lmp_norm_inner=lmp_norm[inner],
         moer_norm_inner=moer_norm[inner],
         status=prob.status,
+        gamma=gamma,
+        battery_charge=battery_charge_inner,
+        battery_discharge=battery_discharge_inner,
+        battery_soc=battery_soc_inner,
     )

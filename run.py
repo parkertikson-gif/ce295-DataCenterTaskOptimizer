@@ -34,6 +34,10 @@ from src.visualize import (
 ALPHAS = [round(x, 1) for x in np.arange(0.0, 1.0001, 0.1)]
 REPORT_ALPHA = 0.5
 
+# Extension toggles. Defaults reproduce the original LP exactly.
+GAMMA = 0.0
+BATTERY_ENABLED = False
+
 
 def normalized_totals(power_inner: np.ndarray, lmp_norm_inner: np.ndarray, moer_norm_inner: np.ndarray) -> tuple[float, float]:
     cost_norm = float(np.sum(lmp_norm_inner * power_inner))
@@ -49,6 +53,7 @@ def main() -> None:
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     config = load_task_config(inputs_dir / "task_config.yaml")
+    config.setdefault("battery", {})["enabled"] = BATTERY_ENABLED
     lmp_df, moer_df = ensure_grid_data(inputs_dir)
 
     demand_df = generate_demand_profile(config)
@@ -66,6 +71,7 @@ def main() -> None:
     baseline_power_by_season: dict[str, dict[str, np.ndarray]] = {}
     optimized_power_by_season: dict[str, dict[str, np.ndarray]] = {}
     kpi_at_report_alpha: dict[str, dict] = {}
+    battery_kpi_at_report_alpha: dict[str, dict] = {}
 
     for season in SEASON_ORDER:
         lmp_24 = season_24h(lmp_df, season)
@@ -90,7 +96,7 @@ def main() -> None:
         carbon_base_lbs = float(np.sum(baseline_total * moer_inner))
 
         for alpha in ALPHAS:
-            res = solve(demand_df, config, lmp_24, moer_24, alpha, season)
+            res = solve(demand_df, config, lmp_24, moer_24, alpha, season, gamma=GAMMA)
             cost_norm_opt, carbon_norm_opt = normalized_totals(
                 res.total_power, lmp_norm_inner, moer_norm_inner
             )
@@ -132,6 +138,13 @@ def main() -> None:
             if abs(alpha - REPORT_ALPHA) < 1e-6:
                 kpi_at_report_alpha[season] = kpi
                 optimized_power_by_season[season] = res.power_by_task
+                if BATTERY_ENABLED and res.battery_charge is not None:
+                    throughput_mwh = float(np.sum(res.battery_charge + res.battery_discharge))
+                    kappa = float(config["battery"].get("degradation_cost", 0.0))
+                    battery_kpi_at_report_alpha[season] = {
+                        "throughput_mwh": throughput_mwh,
+                        "degradation_cost_usd": kappa * throughput_mwh,
+                    }
                 for t in range(168):
                     for task in config["tasks"]:
                         name = task["name"]
@@ -186,6 +199,18 @@ def main() -> None:
             f"carbon avoided {k['carbon_savings_pct']:5.2f}%  "
             f"({k['carbon_savings_tons']:,.1f} tons/week, {k['carbon_savings_annualized_tons']:,.1f} tons/yr)"
         )
+
+    if BATTERY_ENABLED and battery_kpi_at_report_alpha:
+        print("\n=== Battery KPIs (α=0.5, one week) ===")
+        for season in SEASON_ORDER:
+            b = battery_kpi_at_report_alpha.get(season)
+            if b is None:
+                continue
+            print(
+                f"{season.capitalize():9s} "
+                f"throughput {b['throughput_mwh']:,.1f} MWh/week  "
+                f"degradation cost ${b['degradation_cost_usd']:,.0f}/week"
+            )
 
     plot_signals(lmp_df, moer_df, plots_dir / "signals.png")
     plot_pareto(pareto_df, plots_dir / "pareto_frontier.png")
