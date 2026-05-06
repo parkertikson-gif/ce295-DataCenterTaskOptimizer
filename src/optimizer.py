@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from math import sqrt
 
 import cvxpy as cp
+from cvxpy import constraints
 import numpy as np
 import pandas as pd
 
@@ -48,7 +49,8 @@ def solve(
     alpha: float,
     season: str,
     gamma: float = 0.0,
-) -> OptResult:
+    carbon_cap_lbs: float | None = None
+) -> OptResult:  # sourcery skip: merge-list-appends-into-extend
     """Solve the LP for a single (season, alpha).
 
     Padded horizon = HORIZON_HOURS + 2 * W_max; inner hours are
@@ -140,8 +142,12 @@ def solve(
         soc_min = float(battery_cfg["soc_min_frac"]) * E_max
         soc_max = float(battery_cfg["soc_max_frac"]) * E_max
         soc_init = float(battery_cfg["soc_init_frac"]) * E_max
-        kappa = float(battery_cfg["degradation_cost"])
-
+        degradation_cost = float(battery_cfg["degradation_cost"])
+        # Normalize degradation cost so it is on the same scale as normalized LMP/MOER.
+        # Example: degradation_cost = 5 means $5/MWh throughput.
+        # Dividing by mean LMP converts it into a unitless normalized penalty.
+        kappa = degradation_cost / max(float(np.mean(lmp_24)), 1e-9)
+       
         u_charge = cp.Variable(h_pad, nonneg=True)
         u_discharge = cp.Variable(h_pad, nonneg=True)
         soc = cp.Variable(h_pad + 1, nonneg=True)
@@ -159,6 +165,13 @@ def solve(
         p_padded = p_padded + u_charge - u_discharge
 
     constraints.append(p_padded <= p_max)
+    constraints.append(p_padded >= 0)
+    # Carbon cap constraint:
+    # optimized emissions must be <= the carbon cap passed from run.py.
+    inner = slice(w_max, w_max + n_inner)
+    if carbon_cap_lbs is not None:
+        optimized_carbon_lbs = cp.sum(cp.multiply(moer_pad[inner], p_padded[inner]))
+        constraints.append(optimized_carbon_lbs <= carbon_cap_lbs)
 
     objective_expr = (
         alpha * cp.sum(cp.multiply(lmp_norm, p_padded))
@@ -169,10 +182,38 @@ def solve(
         objective_expr = objective_expr + kappa * cp.sum(u_charge + u_discharge)
 
     prob = cp.Problem(cp.Minimize(objective_expr), constraints)
-    prob.solve(solver=cp.CLARABEL)
+    '''
+    if battery_on:
+        combined_signal = alpha * lmp_norm + (1.0 - alpha) * moer_norm
+        print("\n--- SIGNAL DEBUG ---")
+        print("season =", season)
+        print("alpha =", alpha)
+        print("combined min =", combined_signal.min())
+        print("combined max =", combined_signal.max())
+        print("combined spread =", combined_signal.max() - combined_signal.min())
+        print("kappa =", kappa)
+        print("E_max =", E_max)
+        print("max_charge =", max_charge)
+        print("max_discharge =", max_discharge)
+        print("--------------------\n")
+    '''
+    prob.solve(solver=cp.CLARABEL, verbose=False)
 
+
+    if prob.status not in ("optimal", "optimal_inaccurate"):
+        raise RuntimeError(f"Optimization failed with status: {prob.status}")
+    '''
+    if battery_on:
+        print("\n--- BATTERY SOLUTION DEBUG ---")
+        print("solver status =", prob.status)
+        print("charge sum =", np.sum(u_charge.value) if u_charge.value is not None else None)
+        print("discharge sum =", np.sum(u_discharge.value) if u_discharge.value is not None else None)
+        print("soc min =", np.min(soc.value) if soc.value is not None else None)
+        print("soc max =", np.max(soc.value) if soc.value is not None else None)
+        print("------------------------------\n")
+    '''
     # Extract inner 168h results.
-    inner = slice(w_max, w_max + n_inner)
+    # inner = slice(w_max, w_max + n_inner) #chaneged to above for carbon cap constraint
     power_by_task = {}
     for name in task_names:
         vals = per_task_power_padded[name].value
