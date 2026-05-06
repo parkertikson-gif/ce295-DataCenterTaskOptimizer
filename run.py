@@ -25,9 +25,14 @@ from src.optimizer import solve, tile_signal
 from src.visualize import (
     plot_signals,
     plot_pareto,
-    plot_workload_shift_battery_on_off,
-    plot_total_load_battery_on_off,
-    plot_battery_dispatch_48h,
+    plot_workload_shift_multi,
+    plot_total_load_multi,
+    plot_cost_savings_by_scenario,
+    plot_carbon_savings_by_scenario,
+    plot_incremental_bess_savings,
+    plot_bess_economic_breakdown,
+    plot_battery_throughput,
+    plot_net_incremental_bess_value,
     SEASON_ORDER,
 )
 
@@ -367,7 +372,58 @@ def main() -> None:
     pareto_df = pd.DataFrame(all_pareto_rows)
     kpi_df = pd.DataFrame(all_kpi_rows)
     schedule_df = pd.DataFrame(all_schedule_rows)
+    # ---------------------------------------------------------------------
+    # Safety block: build incremental BESS economic columns if not already present
+    # ---------------------------------------------------------------------
+    if "incremental_bess_savings_usd" not in kpi_df.columns:
+        battery_off_ref = (
+            kpi_df[kpi_df["scenario"] == "battery_off"][
+                ["season", "alpha", "cost_savings_usd", "carbon_savings_tons"]
+            ]
+            .rename(
+                columns={
+                    "cost_savings_usd": "cost_savings_usd_battery_off",
+                    "carbon_savings_tons": "carbon_savings_tons_battery_off",
+                }
+            )
+        )
 
+        kpi_df = kpi_df.merge(
+            battery_off_ref,
+            on=["season", "alpha"],
+            how="left",
+        )
+
+        kpi_df["incremental_bess_savings_usd"] = (
+            kpi_df["cost_savings_usd"] - kpi_df["cost_savings_usd_battery_off"]
+        )
+
+        kpi_df["incremental_bess_carbon_tons"] = (
+            kpi_df["carbon_savings_tons"] - kpi_df["carbon_savings_tons_battery_off"]
+        )
+
+    # If the economics fields are missing, make sure your compute_kpis()
+    # return block includes these:
+    # battery_weekly_ownership_cost_usd
+    # battery_degradation_cost_usd
+
+    kpi_df["net_incremental_bess_value_usd"] = (
+        kpi_df["incremental_bess_savings_usd"]
+        - kpi_df["battery_weekly_ownership_cost_usd"]
+        - kpi_df["battery_degradation_cost_usd"]
+    )
+
+    kpi_df["net_incremental_bess_value_annual_usd"] = (
+        kpi_df["net_incremental_bess_value_usd"] * 52.0
+    )
+    
+    kpi_df["bess_should_be_included"] = np.where(
+        (kpi_df["scenario"] != "battery_off")
+        & (kpi_df["net_incremental_bess_value_usd"] > 0),
+        "YES",
+        np.where(kpi_df["scenario"] == "battery_off", "BASELINE", "NO"),
+    )
+    
     # Debug check: interactive_serving should not move because flexibility_hours = 0
     debug_df = schedule_df[
         (schedule_df["alpha"] == 0.5)
@@ -394,83 +450,82 @@ def main() -> None:
     pareto_path = outputs_dir / "pareto_frontier_battery_comparison.csv"
     kpi_path = outputs_dir / "kpi_summary_battery_comparison.csv"
     schedule_path = outputs_dir / "schedule_battery_comparison.csv"
-    # ─────────────────────────────────────────────────────────────────────────────
-    # Incremental BESS value
-    # Compare every BESS scenario against battery_off for the same season and alpha.
-    # ─────────────────────────────────────────────────────────────────────────────
-
-    battery_off_ref = (
-        kpi_df[kpi_df["scenario"] == "battery_off"][
-            ["season", "alpha", "cost_savings_usd", "carbon_savings_tons"]
-        ]
-        .rename(
-            columns={
-                "cost_savings_usd": "cost_savings_usd_battery_off",
-                "carbon_savings_tons": "carbon_savings_tons_battery_off",
-            }
-        )
-    )
-
-    kpi_df = kpi_df.merge(
-        battery_off_ref,
-        on=["season", "alpha"],
-        how="left",
-    )
-
-    kpi_df["incremental_bess_savings_usd"] = (
-        kpi_df["cost_savings_usd"] - kpi_df["cost_savings_usd_battery_off"]
-    )
-
-    kpi_df["incremental_bess_carbon_tons"] = (
-        kpi_df["carbon_savings_tons"] - kpi_df["carbon_savings_tons_battery_off"]
-    )
-
-    kpi_df["net_incremental_bess_value_usd"] = (
-        kpi_df["incremental_bess_savings_usd"]
-        - kpi_df["battery_weekly_ownership_cost_usd"]
-        - kpi_df["battery_degradation_cost_usd"]
-    )
-
-    kpi_df["net_incremental_bess_value_annual_usd"] = (
-        kpi_df["net_incremental_bess_value_usd"] * 52.0
-    )
-
-    kpi_df["bess_should_be_included"] = np.where(
-        (kpi_df["scenario"] != "battery_off")
-        & (kpi_df["net_incremental_bess_value_usd"] > 0),
-        "YES",
-        np.where(kpi_df["scenario"] == "battery_off", "BASELINE", "NO"),
-    )
     pareto_df.to_csv(pareto_path, index=False)
     kpi_df.to_csv(kpi_path, index=False)
     schedule_df.to_csv(schedule_path, index=False)
+
+
+    # PASTE THE 8 PLOT CALLS HERE
+    
     # Temporarily disabled for battery sizing runs.
     # These plots were designed for only battery_off vs battery_on.
     # We will update them later to compare battery_off vs selected BESS size.
 
-    
-    plot_workload_shift_battery_on_off(
+    # ---------------------------------------------------------------------
+    # REPORT PLOTS
+    # ---------------------------------------------------------------------
+    plot_workload_shift_multi(
         schedule_df=schedule_df,
         config=base_config,
-        out_path=plots_dir / "workload_shift_battery_on_off_48h.png",
+        out_path=plots_dir / "workload_shift_multi_48h.png",
         alpha=0.5,
         window=(72, 120),
     )
 
-    plot_total_load_battery_on_off(
+    plot_total_load_multi(
         schedule_df=schedule_df,
-        out_path=plots_dir / "total_load_battery_on_off_48h.png",
+        out_path=plots_dir / "total_load_multi_48h.png",
         alpha=0.5,
         window=(72, 120),
     )
 
-    plot_battery_dispatch_48h(
-        schedule_df=schedule_df,
-        out_path=plots_dir / "battery_dispatch_48h.png",
+    plot_cost_savings_by_scenario(
+        kpi_df=kpi_df,
+        out_path=plots_dir / "cost_savings_by_scenario_alpha_05.png",
         alpha=0.5,
-        window=(72, 120),
     )
-    
+
+    plot_carbon_savings_by_scenario(
+        kpi_df=kpi_df,
+        out_path=plots_dir / "carbon_savings_by_scenario_alpha_05.png",
+        alpha=0.5,
+    )
+
+    plot_incremental_bess_savings(
+        kpi_df=kpi_df,
+        out_path=plots_dir / "incremental_bess_savings_alpha_05.png",
+        alpha=0.5,
+    )
+
+    plot_bess_economic_breakdown(
+        kpi_df=kpi_df,
+        out_path=plots_dir / "bess_economic_breakdown_summer_alpha_05.png",
+        alpha=0.5,
+        season="summer",
+    )
+
+    plot_battery_throughput(
+        kpi_df=kpi_df,
+        out_path=plots_dir / "battery_throughput_alpha_05.png",
+        alpha=0.5,
+    )
+
+    plot_net_incremental_bess_value(
+        kpi_df=kpi_df,
+        out_path=plots_dir / "net_incremental_bess_value_alpha_05.png",
+        alpha=0.5,
+    )
+
+    print(f"Wrote: {plots_dir / 'workload_shift_multi_48h.png'}")
+    print(f"Wrote: {plots_dir / 'total_load_multi_48h.png'}")
+    print(f"Wrote: {plots_dir / 'cost_savings_by_scenario_alpha_05.png'}")
+    print(f"Wrote: {plots_dir / 'carbon_savings_by_scenario_alpha_05.png'}")
+    print(f"Wrote: {plots_dir / 'incremental_bess_savings_alpha_05.png'}")
+    print(f"Wrote: {plots_dir / 'bess_economic_breakdown_summer_alpha_05.png'}")
+    print(f"Wrote: {plots_dir / 'battery_throughput_alpha_05.png'}")
+    print(f"Wrote: {plots_dir / 'net_incremental_bess_value_alpha_05.png'}")
+
+        
     print("\n" + "=" * 80)
     print("SUMMARY: α SCENARIOS WITH BATTERY ON/OFF")
     print("=" * 80)
